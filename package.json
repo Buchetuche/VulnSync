@@ -1,0 +1,151 @@
+{
+  "name": "vulnsync",
+  "displayName": "VulnSync — MSRC & GitHub Advisory",
+  "description": "Detecta el stack del proyecto (.NET, Node.js, Python), sincroniza los boletines de seguridad de Microsoft (MSRC) y la GitHub Advisory Database, y marca en el editor las dependencias y runtimes vulnerables.",
+  "version": "0.1.0",
+  "publisher": "FelixAndresGonzalezOrtiz",
+  "author": "Felix Andres Gonzalez Ortiz",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Buchetuche/VulnSync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Buchetuche/VulnSync/issues"
+  },
+  "homepage": "https://github.com/Buchetuche/VulnSync#readme",
+  "preview": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Linters", "Other"],
+  "keywords": ["security", "vulnerabilities", "msrc", "cve", "ghsa", "nuget", "npm", "pypi"],
+  "icon": "media/icon.png",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "workspaceContains:**/package.json",
+    "workspaceContains:**/*.csproj",
+    "workspaceContains:**/*.fsproj",
+    "workspaceContains:**/global.json",
+    "workspaceContains:**/requirements*.txt",
+    "workspaceContains:**/pyproject.toml",
+    "workspaceContains:**/poetry.lock",
+    "workspaceContains:**/uv.lock"
+  ],
+  "contributes": {
+    "commands": [
+      { "command": "vulnsync.scan", "title": "Escanear proyecto", "category": "VulnSync", "icon": "$(refresh)" },
+      { "command": "vulnsync.sync", "title": "Sincronizar boletines de Microsoft ahora", "category": "VulnSync", "icon": "$(cloud-download)" },
+      { "command": "vulnsync.report", "title": "Generar reporte", "category": "VulnSync", "icon": "$(output)" },
+      { "command": "vulnsync.signIn", "title": "Iniciar sesión en GitHub (más cuota de API)", "category": "VulnSync" },
+      { "command": "vulnsync.clearCache", "title": "Borrar caché", "category": "VulnSync" },
+      { "command": "vulnsync.ignore", "title": "Ignorar esta vulnerabilidad", "category": "VulnSync" },
+      { "command": "vulnsync.openAdvisory", "title": "Abrir boletín", "category": "VulnSync" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        { "id": "vulnsync", "title": "VulnSync", "icon": "media/shield.svg" }
+      ]
+    },
+    "views": {
+      "vulnsync": [
+        { "id": "vulnsync.findings", "name": "Vulnerabilidades" },
+        { "id": "vulnsync.stack", "name": "Stack detectado" }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "vulnsync.findings",
+        "contents": "Aún no hay resultados.\n[Escanear proyecto](command:vulnsync.scan)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        { "command": "vulnsync.scan", "when": "view == vulnsync.findings", "group": "navigation@1" },
+        { "command": "vulnsync.sync", "when": "view == vulnsync.findings", "group": "navigation@2" },
+        { "command": "vulnsync.report", "when": "view == vulnsync.findings", "group": "navigation@3" }
+      ],
+      "view/item/context": [
+        { "command": "vulnsync.openAdvisory", "when": "view == vulnsync.findings && viewItem == finding", "group": "inline" },
+        { "command": "vulnsync.ignore", "when": "view == vulnsync.findings && viewItem == finding" }
+      ],
+      "commandPalette": [
+        { "command": "vulnsync.ignore", "when": "false" },
+        { "command": "vulnsync.openAdvisory", "when": "false" }
+      ]
+    },
+    "configuration": {
+      "title": "VulnSync",
+      "properties": {
+        "vulnsync.ecosystems": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["nuget", "npm", "pip"] },
+          "default": ["nuget", "npm", "pip"],
+          "description": "Ecosistemas a analizar."
+        },
+        "vulnsync.syncIntervalHours": {
+          "type": "number",
+          "default": 12,
+          "minimum": 1,
+          "description": "Cada cuántas horas se vuelven a sincronizar los boletines y se reescanea el proyecto."
+        },
+        "vulnsync.msrc.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Consultar la API CVRF del Microsoft Security Response Center para runtimes/SDK de .NET y ASP.NET Core."
+        },
+        "vulnsync.msrc.monthsToSync": {
+          "type": "number",
+          "default": 12,
+          "minimum": 1,
+          "maximum": 60,
+          "description": "Cuántos boletines mensuales de MSRC se descargan (los más recientes)."
+        },
+        "vulnsync.msrc.checkInstalledRuntimes": {
+          "type": "boolean",
+          "default": true,
+          "description": "Ejecutar 'dotnet --list-runtimes' para comparar los runtimes instalados con las versiones corregidas."
+        },
+        "vulnsync.github.useVSCodeAuth": {
+          "type": "boolean",
+          "default": true,
+          "description": "Usar la sesión de GitHub de VS Code (sin permisos extra) para subir el límite de la API de 60 a 5000 peticiones/hora."
+        },
+        "vulnsync.minimumSeverity": {
+          "type": "string",
+          "enum": ["low", "medium", "high", "critical"],
+          "default": "low",
+          "description": "Severidad mínima que se muestra."
+        },
+        "vulnsync.includeTransitive": {
+          "type": "boolean",
+          "default": true,
+          "description": "Analizar dependencias transitivas desde los lockfiles (package-lock.json, packages.lock.json, poetry.lock, uv.lock)."
+        },
+        "vulnsync.exclude": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["**/node_modules/**", "**/bin/**", "**/obj/**", "**/.venv/**", "**/venv/**", "**/.git/**", "**/dist/**"],
+          "description": "Patrones glob excluidos del escaneo."
+        },
+        "vulnsync.ignoredAdvisories": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "IDs (GHSA-… o CVE-…) que no se deben reportar."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "test": "tsc -p . && node --test out/test/*.test.js",
+    "package": "npx --yes @vscode/vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.9.0"
+  }
+}
