@@ -5,3 +5,9 @@ out/test/**
 tsconfig.json
 .vscode/**
 node_modules/**
+out/test/**
+.vscode-test/**
+.vscode-test.mjs
+.github/**
+test-fixtures/**
+*.vsix

@@ -131,10 +131,8 @@ export function exactPin(declared: string, eco: Ecosystem): string | undefined {
   }
   if (eco === 'nuget') {
     const br = /^\[\s*([^,\]]+)\s*\]$/.exec(d);
-    if (br) return br[1];
-    // En NuGet "1.2.3" significa >=1.2.3, pero la restauración elige exactamente
-    // la mínima disponible, así que en la práctica es la versión usada.
-    return /^\d+(\.\d+){0,3}(-[0-9A-Za-z.\-]+)?$/.test(d) ? d : undefined;
+    // En NuGet "1.2.3" significa >=1.2.3: sin lockfile NO es la versión instalada.
+    return br ? br[1] : undefined;
   }
   // npm
   const m = /^=?v?(\d+\.\d+\.\d+(?:-[0-9A-Za-z.\-]+)?)$/.exec(d);
@@ -145,4 +143,218 @@ export function majorMinor(v: string): string | undefined {
   const p = parseVersion(v);
   if (!p) return undefined;
   return `${p.release[0]}.${p.release[1] ?? 0}`;
+}
+
+// ---------- Intervalos de versiones (VS-002) ----------
+
+/** Intervalo de versiones; un límite ausente significa "sin límite". */
+export interface Interval {
+  lo?: string; loInc: boolean;
+  hi?: string; hiInc: boolean;
+}
+
+const ALL: Interval = { loInc: true, hiInc: true };
+
+function intervalEmpty(i: Interval): boolean {
+  if (i.lo === undefined || i.hi === undefined) return false;
+  const c = compareVersions(i.lo, i.hi);
+  return c > 0 || (c === 0 && !(i.loInc && i.hiInc));
+}
+
+function intersectIntervals(a: Interval, b: Interval): Interval {
+  let lo = a.lo, loInc = a.loInc;
+  if (b.lo !== undefined) {
+    const c = lo === undefined ? 1 : compareVersions(b.lo, lo);
+    if (c > 0) { lo = b.lo; loInc = b.loInc; } else if (c === 0) loInc = loInc && b.loInc;
+  }
+  let hi = a.hi, hiInc = a.hiInc;
+  if (b.hi !== undefined) {
+    const c = hi === undefined ? -1 : compareVersions(b.hi, hi);
+    if (c < 0) { hi = b.hi; hiInc = b.hiInc; } else if (c === 0) hiInc = hiInc && b.hiInc;
+  }
+  return { lo, loInc, hi, hiInc };
+}
+
+/** Aplica un comparador (op, versión) a un intervalo acumulado. */
+function applyComparator(cur: Interval, op: string, v: string): Interval {
+  switch (op) {
+    case '>': return intersectIntervals(cur, { lo: v, loInc: false, hiInc: true });
+    case '>=': return intersectIntervals(cur, { lo: v, loInc: true, hiInc: true });
+    case '<': return intersectIntervals(cur, { hi: v, hiInc: false, loInc: true });
+    case '<=': return intersectIntervals(cur, { hi: v, hiInc: true, loInc: true });
+    default: return intersectIntervals(cur, { lo: v, loInc: true, hi: v, hiInc: true });
+  }
+}
+
+const bump = (parts: number[], idx: number): string => {
+  const out = parts.slice(0, idx + 1);
+  out[idx] += 1;
+  return out.join('.');
+};
+
+/** "1.2.x" → [1.2.0, 1.3.0); "1" → [1.0.0, 2.0.0). undefined si no es parcial/comodín. */
+function partialRange(s: string): Interval | undefined {
+  const m = /^v?(\d+)(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?$/.exec(s.trim());
+  if (!m) return undefined;
+  const nums: number[] = [];
+  for (const g of [m[1], m[2], m[3]]) {
+    if (g === undefined || /^[xX*]$/.test(g)) break;
+    nums.push(parseInt(g, 10));
+  }
+  if (nums.length >= 3 && m[3] !== undefined && !/^[xX*]$/.test(m[3])) return undefined;
+  return { lo: nums.join('.'), loInc: true, hi: bump(nums, nums.length - 1), hiInc: false };
+}
+
+/** Rango de GHSA ("">= 1.0, < 2.0"") → un intervalo, o undefined si no se entiende. */
+export function ghsaRangeToInterval(range: string): Interval | undefined {
+  const parts = range.split(',').map(s => s.trim()).filter(Boolean);
+  if (!parts.length) return undefined;
+  let cur: Interval = { ...ALL };
+  for (const p of parts) {
+    const m = /^(<=|>=|<|>|=)?\s*(\S+)$/.exec(p);
+    if (!m) return undefined;
+    cur = applyComparator(cur, m[1] ?? '=', m[2]);
+  }
+  return cur;
+}
+
+function caret(v: string): Interval | undefined {
+  const p = parseVersion(v);
+  if (!p) return undefined;
+  const r = p.release.slice(0, 3);
+  while (r.length < 3) r.push(0);
+  const i = r.findIndex(n => n !== 0);
+  const idx = i < 0 ? 2 : Math.min(i, 2);
+  return { lo: normalizeVersion(v), loInc: true, hi: bump(r, idx), hiInc: false };
+}
+
+function tilde(v: string, parts: number): Interval | undefined {
+  const p = parseVersion(v);
+  if (!p) return undefined;
+  const r = p.release.slice(0, 3);
+  const idx = parts >= 2 ? 1 : 0;
+  return { lo: normalizeVersion(v), loInc: true, hi: bump(r, idx), hiInc: false };
+}
+
+function npmComparatorSet(set: string): Interval | undefined {
+  const s = set.trim();
+  if (!s || s === '*' || /^[xX]$/.test(s) || s === 'latest') return { ...ALL };
+  const hy = /^(\S+)\s+-\s+(\S+)$/.exec(s);
+  if (hy) {
+    const lo = partialRange(hy[1]);
+    const hi = partialRange(hy[2]);
+    if (!lo || !hi) return undefined;
+    return { lo: lo.lo, loInc: true, hi: hi.hi, hiInc: false };
+  }
+  let cur: Interval = { ...ALL };
+  const tokens = s.replace(/(<=|>=|<|>|=|\^|~>?)\s+/g, '$1').split(/\s+/);
+  for (const t of tokens) {
+    let m = /^\^(.+)$/.exec(t);
+    if (m) { const i = caret(m[1]); if (!i) return undefined; cur = intersectIntervals(cur, i); continue; }
+    m = /^~>?(.+)$/.exec(t);
+    if (m) {
+      const n = (m[1].match(/\.|$/g) ?? []).length;
+      const i = tilde(m[1].replace(/\.[xX*].*$/, ''), n); if (!i) return undefined;
+      cur = intersectIntervals(cur, i); continue;
+    }
+    m = /^(<=|>=|<|>|=)?(.+)$/.exec(t);
+    if (!m) return undefined;
+    const op = m[1] ?? '=';
+    const pr = partialRange(m[2]);
+    if (pr && (/[xX*]/.test(m[2]) || m[2].split('.').length < 3)) {
+      if (op === '=') cur = intersectIntervals(cur, pr);
+      else if (op === '>=') cur = applyComparator(cur, '>=', pr.lo!);
+      else if (op === '>') cur = applyComparator(cur, '>=', pr.hi!);
+      else if (op === '<') cur = applyComparator(cur, '<', pr.lo!);
+      else cur = applyComparator(cur, '<', pr.hi!);
+      continue;
+    }
+    if (!parseVersion(m[2])) return undefined;
+    cur = applyComparator(cur, op, normalizeVersion(m[2]));
+  }
+  return cur;
+}
+
+function pipSpecifierSet(spec: string): Interval | undefined {
+  const s = spec.trim();
+  if (!s || s === '*') return { ...ALL };
+  let cur: Interval = { ...ALL };
+  for (const raw of s.split(',').map(x => x.trim()).filter(Boolean)) {
+    let m = /^\^\s*(\S+)$/.exec(raw);          // Poetry
+    if (m) { const i = caret(m[1]); if (!i) return undefined; cur = intersectIntervals(cur, i); continue; }
+    m = /^~(?!=)\s*(\S+)$/.exec(raw);          // Poetry
+    if (m) { const i = tilde(m[1], m[1].split('.').length); if (!i) return undefined; cur = intersectIntervals(cur, i); continue; }
+    m = /^~=\s*(\S+)$/.exec(raw);              // PEP 440 compatible release
+    if (m) {
+      const p = parseVersion(m[1]);
+      if (!p || p.release.length < 2) return undefined;
+      const r = p.release.slice(0, -1);
+      cur = intersectIntervals(cur, { lo: normalizeVersion(m[1]), loInc: true, hi: bump(r, r.length - 1), hiInc: false });
+      continue;
+    }
+    m = /^===?\s*(\S+?)(\.\*)?$/.exec(raw);
+    if (m) {
+      if (m[2]) {
+        const pr = partialRange(m[1] + '.*'); if (!pr) return undefined;
+        cur = intersectIntervals(cur, pr);
+      } else cur = applyComparator(cur, '=', normalizeVersion(m[1]));
+      continue;
+    }
+    if (/^!=/.test(raw)) continue;             // una exclusión solo estrecha: superconjunto seguro
+    m = /^(<=|>=|<|>)\s*(\S+)$/.exec(raw);
+    if (!m || !parseVersion(m[2])) return undefined;
+    cur = applyComparator(cur, m[1], normalizeVersion(m[2]));
+  }
+  return cur;
+}
+
+function nugetRange(spec: string): Interval | undefined {
+  const s = spec.trim();
+  if (!s || s === '*') return { ...ALL };
+  const br = /^([\[(])\s*([^,\])]*?)\s*(?:(,)\s*([^,\])]*?)\s*)?([\])])$/.exec(s);
+  if (br) {
+    const lo = br[2] || undefined;
+    const hi = br[3] ? (br[4] || undefined) : lo;
+    if ((lo && !parseVersion(lo)) || (hi && !parseVersion(hi))) return undefined;
+    return { lo, loInc: br[1] === '[', hi, hiInc: br[5] === ']' };
+  }
+  if (s.includes('*')) {
+    const pr = partialRange(s.replace(/-\*$/, '').replace(/\.\*$/, '.x'));
+    return pr ? { lo: pr.lo, loInc: true, hiInc: true } : undefined;
+  }
+  if (!parseVersion(s)) return undefined;
+  return { lo: normalizeVersion(s), loInc: true, hiInc: true };   // "1.2.3" ≡ >= 1.2.3
+}
+
+/**
+ * Convierte un rango declarado (SemVer, PEP 440/Poetry o NuGet) en una lista
+ * de intervalos (unión). undefined = no se pudo interpretar.
+ */
+export function declaredToIntervals(declared: string, eco: Ecosystem): Interval[] | undefined {
+  const d = declared.trim();
+  if (!d) return undefined;
+  if (eco === 'npm') {
+    if (/^(file:|link:|git|https?:|workspace:|npm:|github:)/.test(d) || /^[\w.-]+\/[\w.-]+$/.test(d)) return undefined;
+    const sets = d.split('||').map(npmComparatorSet);
+    return sets.every(Boolean) ? (sets as Interval[]).filter(i => !intervalEmpty(i)) : undefined;
+  }
+  const one = eco === 'pip' ? pipSpecifierSet(d) : nugetRange(d);
+  return one ? (intervalEmpty(one) ? [] : [one]) : undefined;
+}
+
+export function intervalsOverlap(a: Interval, b: Interval): boolean {
+  return !intervalEmpty(intersectIntervals(a, b));
+}
+
+/**
+ * ¿Alguna versión permitida por el rango declarado cae en el rango vulnerable?
+ * 'unknown' cuando alguno de los dos rangos no se puede interpretar.
+ */
+export function declaredIntersectsVulnerable(
+  declared: string, eco: Ecosystem, vulnerableRange: string,
+): boolean | 'unknown' {
+  const dec = declaredToIntervals(declared, eco);
+  const vul = ghsaRangeToInterval(vulnerableRange);
+  if (!dec || !vul) return 'unknown';
+  return dec.some(d => intervalsOverlap(d, vul));
 }

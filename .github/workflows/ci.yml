@@ -1,0 +1,37 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Compilar y probar el núcleo
+        run: npm test
+      - name: Pruebas de integración (VS Code)
+        run: xvfb-run -a npm run test:integration
+      - name: Empaquetar VSIX
+        run: npm run package -- --out vulnsync.vsix
+      - name: SHA-256 del VSIX
+        run: sha256sum vulnsync.vsix | tee vulnsync.vsix.sha256
+      - name: Smoke test — instalar el VSIX y comprobar el contenido
+        run: |
+          npx --no-install vsce ls --tree > /dev/null
+          unzip -l vulnsync.vsix | grep -q "extension/out/extension.js"
+          ! unzip -l vulnsync.vsix | grep -q "extension/src/"
+      - name: El repositorio sigue limpio tras compilar
+        run: git diff --exit-code
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: |
+            vulnsync.vsix
+            vulnsync.vsix.sha256
