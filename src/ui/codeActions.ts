@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { findingByDiagnostic, SOURCE } from './diagnostics';
 import { Finding } from '../core/types';
+import { planUpgrade, UpgradePlan } from '../core/fix';
 
 /** Acciones rápidas: subir a la versión corregida, abrir el boletín, ignorar. */
 export class VulnCodeActions implements vscode.CodeActionProvider {
@@ -13,13 +14,21 @@ export class VulnCodeActions implements vscode.CodeActionProvider {
       const f = findingByDiagnostic.get(diag);
       if (!f) continue;
 
-      const edit = upgradeEdit(doc, diag.range, f);
-      if (edit) {
+      const plan = upgradePlan(doc, diag.range, f);
+      if (plan?.kind === 'edit') {
         const a = new vscode.CodeAction(`Actualizar ${f.packageName} a ${f.fixedVersion}`, vscode.CodeActionKind.QuickFix);
         a.edit = new vscode.WorkspaceEdit();
-        a.edit.replace(doc.uri, diag.range, edit);
+        // needsConfirmation: VS Code muestra una vista previa del cambio antes de aplicarlo.
+        a.edit.replace(doc.uri, diag.range, plan.text, {
+          label: `${f.packageName}: ${doc.getText(diag.range)} → ${plan.text}`, needsConfirmation: true,
+        });
         a.diagnostics = [diag];
         a.isPreferred = true;
+        actions.push(a);
+      } else if (plan?.kind === 'suggest') {
+        const a = new vscode.CodeAction(`Sugerencia: ${f.packageName} ≥ ${f.fixedVersion} (editar manualmente)`, vscode.CodeActionKind.QuickFix);
+        a.command = { title: 'Ver sugerencia', command: 'vulnsync.suggestFix', arguments: [f.packageName, f.fixedVersion, plan.reason] };
+        a.diagnostics = [diag];
         actions.push(a);
       }
       if (f.ecosystem === 'runtime') {
@@ -41,21 +50,14 @@ export class VulnCodeActions implements vscode.CodeActionProvider {
   }
 }
 
-/** Texto de reemplazo para la versión declarada, según el tipo de manifiesto. */
-function upgradeEdit(doc: vscode.TextDocument, range: vscode.Range, f: Finding): string | undefined {
+/** Plan de actualización según el manifiesto; nunca amplía el rango original. */
+function upgradePlan(doc: vscode.TextDocument, range: vscode.Range, f: Finding): UpgradePlan | undefined {
   if (!f.fixedVersion || !f.direct || f.ecosystem === 'runtime') return undefined;
   const file = doc.fileName.toLowerCase();
   const current = doc.getText(range);
-  if (f.ecosystem === 'npm' && file.endsWith('package.json')) {
-    const prefix = /^[\^~]/.exec(current)?.[0] ?? (/^[<>=]/.test(current) ? '^' : '');
-    return prefix + f.fixedVersion;
-  }
-  if (f.ecosystem === 'nuget' && /\.(cs|fs|vb)proj$|\.props$/.test(file)) {
-    return /^\[.*\]$/.test(current) ? `[${f.fixedVersion}]` : f.fixedVersion;
-  }
-  if (f.ecosystem === 'pip' && (/requirements.*\.txt$/.test(file) || file.endsWith('pyproject.toml'))) {
-    if (/^[\^~]?\d/.test(current)) return (/^[\^~]/.exec(current)?.[0] ?? '') + f.fixedVersion; // poetry
-    return current.startsWith('==') ? `==${f.fixedVersion}` : `>=${f.fixedVersion}`;
-  }
-  return undefined;
+  const ok =
+    (f.ecosystem === 'npm' && file.endsWith('package.json')) ||
+    (f.ecosystem === 'nuget' && /\.(cs|fs|vb)proj$|\.props$/.test(file)) ||
+    (f.ecosystem === 'pip' && (/requirements.*\.txt$/.test(file) || file.endsWith('pyproject.toml') || file.endsWith('pipfile')));
+  return ok ? planUpgrade(f.ecosystem, current, f.fixedVersion) : undefined;
 }
