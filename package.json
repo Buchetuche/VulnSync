@@ -2,7 +2,7 @@
   "name": "vulnsync",
   "displayName": "VulnSync — MSRC & GitHub Advisory",
   "description": "Detecta el stack del proyecto (.NET, Node.js, Python), sincroniza los boletines de seguridad de Microsoft (MSRC) y la GitHub Advisory Database, y marca en el editor las dependencias y runtimes vulnerables.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "FelixAndresGonzalezOrtiz",
   "author": "Felix Andres Gonzalez Ortiz",
   "license": "MIT",
@@ -30,8 +30,17 @@
     "workspaceContains:**/requirements*.txt",
     "workspaceContains:**/pyproject.toml",
     "workspaceContains:**/poetry.lock",
-    "workspaceContains:**/uv.lock"
+    "workspaceContains:**/uv.lock",
+    "workspaceContains:**/Pipfile",
+    "workspaceContains:**/Pipfile.lock"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "En un workspace no confiable VulnSync no ejecuta 'dotnet --list-runtimes'; los hallazgos de runtime quedan por confirmar.",
+      "restrictedConfigurations": ["vulnsync.msrc.checkInstalledRuntimes"]
+    }
+  },
   "contributes": {
     "commands": [
       { "command": "vulnsync.scan", "title": "Escanear proyecto", "category": "VulnSync", "icon": "$(refresh)" },
@@ -40,7 +49,8 @@
       { "command": "vulnsync.signIn", "title": "Iniciar sesión en GitHub (más cuota de API)", "category": "VulnSync" },
       { "command": "vulnsync.clearCache", "title": "Borrar caché", "category": "VulnSync" },
       { "command": "vulnsync.ignore", "title": "Ignorar esta vulnerabilidad", "category": "VulnSync" },
-      { "command": "vulnsync.openAdvisory", "title": "Abrir boletín", "category": "VulnSync" }
+      { "command": "vulnsync.openAdvisory", "title": "Abrir boletín", "category": "VulnSync" },
+      { "command": "vulnsync.suggestFix", "title": "Ver sugerencia de corrección", "category": "VulnSync" }
     ],
     "viewsContainers": {
       "activitybar": [
@@ -71,7 +81,8 @@
       ],
       "commandPalette": [
         { "command": "vulnsync.ignore", "when": "false" },
-        { "command": "vulnsync.openAdvisory", "when": "false" }
+        { "command": "vulnsync.openAdvisory", "when": "false" },
+        { "command": "vulnsync.suggestFix", "when": "false" }
       ]
     },
     "configuration": {
@@ -140,12 +151,19 @@
   "scripts": {
     "compile": "tsc -p .",
     "watch": "tsc -watch -p .",
+    "vscode:prepublish": "npm run compile",
     "test": "tsc -p . && node --test out/test/*.test.js",
-    "package": "npx --yes @vscode/vsce package"
+    "test:integration": "tsc -p . && vscode-test",
+    "package": "vsce package"
   },
   "devDependencies": {
+    "@types/mocha": "10.0.10",
     "@types/node": "^20.19.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/test-cli": "0.0.15",
+    "@vscode/test-electron": "3.1.0",
+    "@vscode/vsce": "4.0.0",
+    "mocha": "12.0.3",
     "typescript": "^5.9.0"
   }
 }

@@ -1,12 +1,12 @@
 // Detección del stack a partir de los archivos del proyecto.
 // Recibe contenidos ya leídos para que sea independiente de VS Code.
 
-import { Dependency, Ecosystem, ProjectStack, RuntimeTarget } from './types';
+import { Dependency, Ecosystem, ProjectStack, RuntimeTarget, SdkInfo } from './types';
 import { normalizeName } from './text';
-import { parsePackageJson, parsePackageLock } from './parsers/npm';
+import { lockEntryToDependency, NpmLock, parsePackageJson, parsePackageLockTree, resolveWorkspace } from './parsers/npm';
 import { parsePnpmLock, parseYarnLock } from './parsers/npmLocks';
-import { parseGlobalJson, parseMsBuildProject, parseNugetLock } from './parsers/nuget';
-import { parsePipfileLock, parsePyproject, parseRequirements, parseTomlLock } from './parsers/python';
+import { parseGlobalJson, parseMsBuildProject, parseNugetLock, parseRuntimeConfig } from './parsers/nuget';
+import { parsePipfile, parsePipfileLock, parsePyproject, parseRequirements, parseTomlLock } from './parsers/python';
 
 export interface ProjectFile { path: string; text: string; }
 export interface DetectOptions { ecosystems: Ecosystem[]; includeTransitive: boolean; }
@@ -15,10 +15,23 @@ export interface DetectOptions { ecosystems: Ecosystem[]; includeTransitive: boo
 export const MANIFEST_GLOB =
   '**/{package.json,package-lock.json,npm-shrinkwrap.json,yarn.lock,pnpm-lock.yaml,' +
   '*.csproj,*.fsproj,*.vbproj,Directory.Packages.props,Directory.Build.props,packages.lock.json,global.json,' +
-  'requirements*.txt,pyproject.toml,poetry.lock,uv.lock,Pipfile.lock}';
+  'requirements*.txt,pyproject.toml,poetry.lock,uv.lock,Pipfile,Pipfile.lock}';
+
+/** Salida de compilación de .NET (suele estar excluida del escaneo general). */
+export const RUNTIMECONFIG_GLOB = '**/*.runtimeconfig.json';
 
 const dirOf = (p: string) => p.replace(/[\\/][^\\/]*$/, '');
 const baseOf = (p: string) => p.split(/[\\/]/).pop()!.toLowerCase();
+const slash = (p: string) => p.replace(/\\/g, '/');
+
+/** Ruta del directorio `dir` relativa a `base` ('' si coinciden); undefined si no está dentro. */
+function relDir(base: string, dir: string): string | undefined {
+  const b = slash(base).replace(/\/+$/, '');
+  const d = slash(dir).replace(/\/+$/, '');
+  const cmp = (x: string) => (/^[A-Za-z]:\//.test(x) ? x.toLowerCase() : x);
+  if (cmp(d) === cmp(b)) return '';
+  return cmp(d).startsWith(cmp(b) + '/') ? d.slice(b.length + 1) : undefined;
+}
 
 export function detectStack(files: ProjectFile[], opts: DetectOptions): ProjectStack {
   const byDir = new Map<string, Map<string, ProjectFile>>();
@@ -30,6 +43,7 @@ export function detectStack(files: ProjectFile[], opts: DetectOptions): ProjectS
   const want = new Set(opts.ecosystems);
   const deps: Dependency[] = [];
   const runtimes: RuntimeTarget[] = [];
+  const sdks: SdkInfo[] = [];
   const manifests: string[] = [];
 
   if (want.has('npm')) deps.push(...detectNpm(byDir, opts, manifests));
@@ -37,35 +51,28 @@ export function detectStack(files: ProjectFile[], opts: DetectOptions): ProjectS
     const r = detectNuget(files, byDir, opts, manifests);
     deps.push(...r.deps);
     runtimes.push(...r.runtimes);
+    sdks.push(...r.sdks);
   }
   if (want.has('pip')) deps.push(...detectPython(byDir, opts, manifests));
 
   const ecosystems = [...new Set(deps.map(d => d.ecosystem))];
   if (runtimes.length && !ecosystems.includes('nuget')) ecosystems.push('nuget');
-  return { ecosystems, dependencies: deps, runtimes: dedupeRuntimes(runtimes), manifests };
+  return { ecosystems, dependencies: deps, runtimes: dedupeRuntimes(runtimes), sdks, manifests };
 }
 
 // ---------- npm ----------
 function detectNpm(byDir: Map<string, Map<string, ProjectFile>>, opts: DetectOptions, manifests: string[]): Dependency[] {
   const out: Dependency[] = [];
-  const lockCache = new Map<string, Dependency[]>();
+  const lockCache = new Map<string, NpmLock | undefined>();
+  const flatCache = new Map<string, Dependency[]>();
 
-  const lockFor = (dir: string, direct: Set<string>): Dependency[] | undefined => {
+  /** Lockfile más cercano hacia arriba. */
+  const findLock = (dir: string): ProjectFile | undefined => {
     for (let d = dir; ; d = dirOf(d)) {
       const files = byDir.get(d);
       const lock = files?.get('package-lock.json') ?? files?.get('npm-shrinkwrap.json')
         ?? files?.get('yarn.lock') ?? files?.get('pnpm-lock.yaml');
-      if (lock) {
-        if (!lockCache.has(lock.path)) {
-          const name = baseOf(lock.path);
-          const parsed = name === 'yarn.lock' ? parseYarnLock(lock.path, lock.text, direct)
-            : name === 'pnpm-lock.yaml' ? parsePnpmLock(lock.path, lock.text, direct)
-            : parsePackageLock(lock.path, lock.text, direct);
-          lockCache.set(lock.path, parsed);
-          manifests.push(lock.path);
-        }
-        return lockCache.get(lock.path);
-      }
+      if (lock) return lock;
       if (dirOf(d) === d) return undefined;
     }
   };
@@ -75,18 +82,54 @@ function detectNpm(byDir: Map<string, Map<string, ProjectFile>>, opts: DetectOpt
     if (!pkg || /[\\/]node_modules[\\/]/.test(pkg.path)) continue;
     manifests.push(pkg.path);
     const direct = parsePackageJson(pkg.path, pkg.text);
-    const directNames = new Set(direct.map(d => d.name));
-    const lock = lockFor(dir, directNames);
+    const directNames = [...new Set(direct.map(d => d.name))];
+    const lock = findLock(dir);
     if (!lock) { out.push(...direct); continue; }
 
-    const resolved = new Map<string, string>();
-    for (const l of lock) if (!resolved.has(l.name)) resolved.set(l.name, l.version!);
-    for (const d of direct) {
-      const v = resolved.get(d.name);
-      out.push(v ? { ...d, version: v, approximate: false } : d);
+    const lockName = baseOf(lock.path);
+    if (lockName === 'package-lock.json' || lockName === 'npm-shrinkwrap.json') {
+      if (!lockCache.has(lock.path)) {
+        lockCache.set(lock.path, parsePackageLockTree(lock.path, lock.text));
+        manifests.push(lock.path);
+      }
+      const tree = lockCache.get(lock.path);
+      const ws = relDir(dirOf(lock.path), dir);
+      if (!tree || ws === undefined) { out.push(...direct); continue; }
+      // Cada workspace recibe la versión que le corresponde por su ruta en el árbol.
+      const res = resolveWorkspace(tree, ws, directNames);
+      for (const d of direct) {
+        const e = res.direct.get(d.name);
+        out.push(e ? { ...d, version: e.version, approximate: false } : d);
+      }
+      if (opts.includeTransitive) {
+        for (const e of res.transitive) out.push(lockEntryToDependency(tree, e, false));
+      }
+      continue;
     }
-    if (opts.includeTransitive && byDir.get(dir)?.has(lockFileName(files))) {
-      for (const l of lock) if (!directNames.has(l.name) || resolved.get(l.name) !== l.version) out.push({ ...l, direct: false });
+
+    // yarn.lock / pnpm-lock.yaml: índice por nombre. Si un nombre tiene varias
+    // versiones no se elige una al azar: queda sin determinar (se usa el rango).
+    if (!flatCache.has(lock.path)) {
+      flatCache.set(lock.path, lockName === 'yarn.lock'
+        ? parseYarnLock(lock.path, lock.text, new Set(directNames))
+        : parsePnpmLock(lock.path, lock.text, new Set(directNames)));
+      manifests.push(lock.path);
+    }
+    const flat = flatCache.get(lock.path)!;
+    const versions = new Map<string, Set<string>>();
+    for (const l of flat) {
+      if (!versions.has(l.name)) versions.set(l.name, new Set());
+      versions.get(l.name)!.add(l.version!);
+    }
+    for (const d of direct) {
+      const vs = versions.get(d.name);
+      out.push(vs && vs.size === 1 ? { ...d, version: [...vs][0], approximate: false } : d);
+    }
+    if (opts.includeTransitive && lock.path === (byDir.get(dir)?.get(lockFileName(files)))?.path) {
+      for (const l of flat) {
+        const vs = versions.get(l.name);
+        if (!directNames.includes(l.name) || (vs && vs.size > 1)) out.push({ ...l, direct: false });
+      }
     }
   }
   return dedupe(out);
@@ -99,6 +142,7 @@ function lockFileName(files: Map<string, ProjectFile>): string {
 function detectNuget(files: ProjectFile[], byDir: Map<string, Map<string, ProjectFile>>, opts: DetectOptions, manifests: string[]) {
   const deps: Dependency[] = [];
   const runtimes: RuntimeTarget[] = [];
+  const sdks: SdkInfo[] = [];
 
   // Versiones centrales (Directory.Packages.props), del más cercano hacia arriba.
   const centralCache = new Map<string, Map<string, Dependency>>();
@@ -119,7 +163,7 @@ function detectNuget(files: ProjectFile[], byDir: Map<string, Map<string, Projec
 
   for (const f of files) {
     const base = baseOf(f.path);
-    if (base === 'global.json') { runtimes.push(...parseGlobalJson(f.path, f.text)); manifests.push(f.path); continue; }
+    if (base === 'global.json') { sdks.push(...parseGlobalJson(f.path, f.text)); manifests.push(f.path); continue; }
     if (!/\.(cs|fs|vb)proj$/.test(base) && base !== 'directory.build.props') continue;
     manifests.push(f.path);
     const r = parseMsBuildProject(f.path, f.text);
@@ -143,15 +187,36 @@ function detectNuget(files: ProjectFile[], byDir: Map<string, Map<string, Projec
     } else {
       deps.push(...projectDeps);
     }
-    // Paquetes Microsoft.AspNetCore.* explícitos implican ASP.NET Core
+    // Paquetes Microsoft.AspNetCore.* explícitos: evidencia débil de ASP.NET Core
     for (const d of projectDeps) {
       const mm = d.version && /^(\d+)\.(\d+)/.exec(d.version);
       if (mm && /^Microsoft\.AspNetCore\./i.test(d.name) && parseInt(mm[1], 10) >= 5) {
-        runtimes.push({ product: 'ASP.NET Core', band: `${mm[1]}.${mm[2]}`, source: `paquete ${d.name}`, location: d.location });
+        runtimes.push({
+          product: 'ASP.NET Core', band: `${mm[1]}.${mm[2]}`, app: f.path.split(/[\\/]/).pop()!, appKind: 'implied',
+          evidence: `paquete ${d.name}`, source: `paquete ${d.name}`, location: d.location,
+        });
       }
     }
   }
-  return { deps: dedupe(deps), runtimes };
+
+  // runtimeconfig.json (salida de compilación): evidencia directa de la versión solicitada,
+  // de si la aplicación es autocontenida y de la política de roll-forward.
+  for (const f of files) {
+    if (!/\.runtimeconfig\.json$/i.test(f.path)) continue;
+    const rc = parseRuntimeConfig(f.path, f.text);
+    if (!rc) continue;
+    manifests.push(f.path);
+    const tfm = rc.tfm ? /^net(?:coreapp)?(\d+\.\d+)/.exec(rc.tfm)?.[1] : undefined;
+    for (const t of runtimes) {
+      const appName = t.app.replace(/\.(cs|fs|vb)proj$/i, '').toLowerCase();
+      if (t.appKind === 'implied' || appName !== rc.assembly.toLowerCase() || (tfm && tfm !== t.band)) continue;
+      const v = rc.selfContained ? rc.includedVersion : rc.frameworkVersion;
+      if (v && v.startsWith(t.band + '.')) { t.version = v; t.evidence = `${f.path.split(/[\\/]/).pop()}`; }
+      if (rc.selfContained) t.selfContained = true;
+      if (rc.rollForward) t.rollForward = rc.rollForward;
+    }
+  }
+  return { deps: dedupe(deps), runtimes, sdks };
 }
 
 // ---------- Python ----------
@@ -162,6 +227,7 @@ function detectPython(byDir: Map<string, Map<string, ProjectFile>>, opts: Detect
     for (const [name, f] of files) {
       if (/^requirements.*\.txt$/.test(name)) { direct.push(...parseRequirements(f.path, f.text)); manifests.push(f.path); }
       else if (name === 'pyproject.toml') { direct.push(...parsePyproject(f.path, f.text)); manifests.push(f.path); }
+      else if (name === 'pipfile') { direct.push(...parsePipfile(f.path, f.text)); manifests.push(f.path); }
     }
     const directNames = new Set(direct.map(d => normalizeName('pip', d.name)));
     const lockF = files.get('poetry.lock') ?? files.get('uv.lock') ?? files.get('pipfile.lock');
@@ -175,9 +241,12 @@ function detectPython(byDir: Map<string, Map<string, ProjectFile>>, opts: Detect
       const v = resolved.get(normalizeName('pip', d.name));
       out.push(v ? { ...d, version: v, approximate: false } : d);
     }
+    // Sin manifiesto no se distingue directas de transitivas: se incluye todo el lockfile
+    // para no producir un escaneo vacío.
+    const canDistinguish = direct.length > 0;
     for (const l of lock) {
       if (directNames.has(normalizeName('pip', l.name))) continue;
-      if (opts.includeTransitive || l.direct) out.push(l);
+      if (opts.includeTransitive || l.direct || !canDistinguish) out.push(l);
     }
   }
   return dedupe(out);
@@ -186,7 +255,7 @@ function detectPython(byDir: Map<string, Map<string, ProjectFile>>, opts: Detect
 function dedupe(deps: Dependency[]): Dependency[] {
   const seen = new Set<string>();
   return deps.filter(d => {
-    const k = `${d.ecosystem}|${normalizeName(d.ecosystem, d.name)}|${d.version}|${d.location.file}|${d.location.line}`;
+    const k = `${d.ecosystem}|${normalizeName(d.ecosystem, d.name)}|${d.version}|${d.declared}|${d.location.file}|${d.location.line}`;
     if (seen.has(k)) return false;
     seen.add(k);
     return true;
@@ -195,7 +264,9 @@ function dedupe(deps: Dependency[]): Dependency[] {
 
 function dedupeRuntimes(rs: RuntimeTarget[]): RuntimeTarget[] {
   const seen = new Set<string>();
-  return rs.filter(r => {
+  // Los runtimes deducidos de un paquete ceden ante los de un proyecto (TFM) en el mismo archivo.
+  const sorted = [...rs].sort((a, b) => Number(a.appKind === 'implied') - Number(b.appKind === 'implied'));
+  return sorted.filter(r => {
     const k = `${r.product}|${r.band}|${r.location.file}`;
     if (seen.has(k)) return false;
     seen.add(k);

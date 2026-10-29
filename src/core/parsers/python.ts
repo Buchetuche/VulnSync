@@ -119,3 +119,37 @@ export function parsePipfileLock(file: string, text: string, directNames: Set<st
   }
   return out;
 }
+
+/**
+ * Pipfile: secciones [packages] y [dev-packages] (ambas se incluyen).
+ *   name = "==1.2.3"  |  name = "*"  |  name = { version = ">=2", extras = [...] }
+ */
+export function parsePipfile(file: string, text: string): Dependency[] {
+  const out: Dependency[] = [];
+  let section = '';
+  let offset = 0;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.replace(/(^|\s)#.*$/, '');
+    const sec = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+    if (sec) { section = sec[1].trim(); offset += rawLine.length + 1; continue; }
+    if (section === 'packages' || section === 'dev-packages') {
+      const head = /^\s*"?([A-Za-z0-9][A-Za-z0-9._-]*)"?\s*=\s*(.*)$/.exec(line);
+      // Valor simple ("==1.2") o tabla ({ version = "==1.2", ... }); sin versión (git, path) se omite.
+      const val = head ? (/^"([^"]*)"/.exec(head[2]) ?? /^\{.*?\bversion\s*=\s*"([^"]*)"/.exec(head[2])) : null;
+      if (head && val) {
+        const text0 = val[1];
+        const declared = text0.replace(/\s+/g, '');
+        const pin = declared && declared !== '*' ? exactPin(declared, 'pip') : undefined;
+        const hasLower = /(^|,)(>=|~=|==)/.test(declared);
+        out.push({
+          ecosystem: 'pip', name: head[1], declared: declared || '*', direct: true,
+          version: pin ?? (hasLower ? lowerBoundOf(declared.replace(/^~=|^>=|^==/, ''), 'pip') : undefined),
+          approximate: !pin,
+          location: locate(text, file, offset + Math.max(line.indexOf(`"${text0}"`) + 1, 0), Math.max(text0.length, 1)),
+        });
+      }
+    }
+    offset += rawLine.length + 1;
+  }
+  return out;
+}

@@ -1,4 +1,4 @@
-import { Dependency, RuntimeTarget } from '../types';
+import { Dependency, RuntimeTarget, SdkInfo } from '../types';
 import { locate, locateNeedle } from '../text';
 import { exactPin, lowerBoundOf } from '../version';
 
@@ -60,7 +60,13 @@ export function parseMsBuildProject(file: string, text: string): CsprojResult {
   const runtimes: RuntimeTarget[] = [];
   const isWeb = /<Project\s+Sdk\s*=\s*["']Microsoft\.NET\.Sdk\.(Web|Razor|BlazorWebAssembly)/i.test(text)
     || /<FrameworkReference\s+Include\s*=\s*["']Microsoft\.AspNetCore\.App/i.test(text);
+  const isExe = isWeb
+    || /<OutputType>\s*(Exe|WinExe)\s*</i.test(text)
+    || /<Project\s+Sdk\s*=\s*["']Microsoft\.NET\.Sdk\.Worker/i.test(text);
+  const selfContained = /<SelfContained>\s*true\s*</i.test(text);
+  const rollForward = /<RollForward>\s*([^<\s]+)\s*</i.exec(text)?.[1];
   const rfv = /<RuntimeFrameworkVersion>\s*([^<\s]+)\s*</.exec(text)?.[1];
+  const app = baseName(file);
   const tfRe = /<TargetFrameworks?>\s*([^<]+?)\s*<\/TargetFrameworks?>/g;
   while ((m = tfRe.exec(text))) {
     for (const tfm of m[1].split(';').map(s => s.trim()).filter(Boolean)) {
@@ -78,8 +84,14 @@ export function parseMsBuildProject(file: string, text: string): CsprojResult {
   function addRuntime(band: string) {
     const loc = locateNeedle(text, file, band, text.search(/<TargetFrameworks?>/));
     const version = rfv && rfv.startsWith(band + '.') ? rfv : undefined;
-    runtimes.push({ product: '.NET', band, version, source: `TargetFramework en ${baseName(file)}`, location: loc });
-    if (isWeb) runtimes.push({ product: 'ASP.NET Core', band, version, source: `SDK Web en ${baseName(file)}`, location: loc });
+    const base = {
+      band, version, app, appKind: (isExe ? 'app' : 'library') as 'app' | 'library',
+      selfContained, rollForward,
+      evidence: version ? `RuntimeFrameworkVersion en ${app}` : `TargetFramework en ${app}`,
+      source: `TargetFramework en ${app}`, location: loc,
+    };
+    runtimes.push({ product: '.NET', ...base });
+    if (isWeb) runtimes.push({ product: 'ASP.NET Core', ...base, source: `SDK Web en ${app}` });
   }
   return { dependencies: deps, centrallyManaged: central, runtimes };
 }
@@ -109,19 +121,43 @@ export function parseNugetLock(file: string, text: string): Dependency[] {
   return out;
 }
 
-/** global.json → versión de SDK fijada. */
-export function parseGlobalJson(file: string, text: string): RuntimeTarget[] {
+/** global.json → SDK fijado. Es evidencia auxiliar, NO un runtime. */
+export function parseGlobalJson(file: string, text: string): SdkInfo[] {
   let json: any;
   try { json = JSON.parse(text); } catch { return []; }
   const sdk: string | undefined = json?.sdk?.version;
   if (!sdk) return [];
-  const p = /^(\d+)\.(\d+)/.exec(sdk);
-  if (!p) return [];
-  return [{
-    product: '.NET', band: `${p[1]}.${p[2]}`,
-    source: `SDK ${sdk} fijado en global.json`,
-    location: locateNeedle(text, file, sdk),
-  }];
+  return [{ version: sdk, source: 'global.json', location: locateNeedle(text, file, sdk) }];
+}
+
+export interface RuntimeConfig {
+  /** Nombre del ensamblado (de `X.runtimeconfig.json`). */
+  assembly: string;
+  tfm?: string;
+  frameworkVersion?: string;
+  rollForward?: string;
+  selfContained: boolean;
+  /** Versión incluida cuando la aplicación es autocontenida. */
+  includedVersion?: string;
+}
+
+/** `*.runtimeconfig.json` generado en la compilación. */
+export function parseRuntimeConfig(file: string, text: string): RuntimeConfig | undefined {
+  let json: any;
+  try { json = JSON.parse(text); } catch { return undefined; }
+  const o = json?.runtimeOptions;
+  if (!o || typeof o !== 'object') return undefined;
+  const assembly = baseName(file).replace(/\.runtimeconfig(\.dev)?\.json$/i, '');
+  const fw = (o.framework ?? (Array.isArray(o.frameworks) ? o.frameworks.find((f: any) => /NETCore\.App|AspNetCore\.App/.test(f?.name)) : undefined));
+  const included = Array.isArray(o.includedFrameworks)
+    ? o.includedFrameworks.find((f: any) => f?.name === 'Microsoft.NETCore.App') : undefined;
+  return {
+    assembly, tfm: o.tfm,
+    frameworkVersion: typeof fw?.version === 'string' ? fw.version : undefined,
+    rollForward: typeof o.rollForward === 'string' ? o.rollForward : (typeof fw?.rollForward === 'string' ? fw.rollForward : undefined),
+    selfContained: !!included,
+    includedVersion: typeof included?.version === 'string' ? included.version : undefined,
+  };
 }
 
 function attr(attrs: string, name: string): string | undefined {

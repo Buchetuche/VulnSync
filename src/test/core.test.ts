@@ -35,7 +35,8 @@ test('lowerBoundOf / exactPin', () => {
   assert.equal(lowerBoundOf('*', 'npm'), undefined);
   assert.equal(exactPin('==2.31.0', 'pip'), '2.31.0');
   assert.equal(exactPin('>=2.31', 'pip'), undefined);
-  assert.equal(exactPin('13.0.1', 'nuget'), '13.0.1');
+  assert.equal(exactPin('13.0.1', 'nuget'), undefined);   // sin lockfile, "1.2.3" es >=1.2.3
+  assert.equal(exactPin('[13.0.1]', 'nuget'), '13.0.1');
   assert.equal(exactPin('4.17.21', 'npm'), '4.17.21');
   assert.equal(exactPin('^4.17.21', 'npm'), undefined);
 });
@@ -49,7 +50,7 @@ const files: ProjectFile[] = [
     packages: {
       '': { name: 'web' },
       'node_modules/lodash': { version: '4.17.15' },
-      'node_modules/express': { version: '4.18.2' },
+      'node_modules/express': { version: '4.18.2', dependencies: { qs: '^6.10.0' } },
       'node_modules/jest': { version: '29.7.0', dev: true },
       'node_modules/qs': { version: '6.10.3' },
     },
@@ -145,10 +146,11 @@ test('queryGithubAdvisories: lotes por ecosistema, paginación y token', async (
   };
   const s = detectStack(files, { ecosystems: ['npm', 'nuget'], includeTransitive: false });
   const adv = await queryGithubAdvisories(s.dependencies, { fetch: fake, token: 't0k' });
-  assert.equal(adv.length, 2);
+  assert.equal(adv.advisories.length, 2);
+  assert.ok(adv.batches.every(b => b.ok));
   assert.equal(calls.length, 3);
   assert.ok(calls[0].includes('affects='));
-  assert.ok(decodeURIComponent(calls.find(c => c.includes('nuget'))!).includes('Newtonsoft.Json@12.0.3'));
+  assert.ok(decodeURIComponent(calls.find(c => c.includes('nuget'))!).includes('affects=Newtonsoft.Json'));   // sin lockfile se consulta por nombre
   assert.equal(auth, 'Bearer t0k');
 });
 

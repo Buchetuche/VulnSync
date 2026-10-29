@@ -1,9 +1,10 @@
 import * as vscode from 'vscode';
 import { execFile } from 'child_process';
-import { detectStack, MANIFEST_GLOB, ProjectFile } from './core/detect';
-import { renderMarkdownReport, scanStack, ScanResult } from './core/scan';
+import { detectStack, MANIFEST_GLOB, ProjectFile, RUNTIMECONFIG_GLOB } from './core/detect';
+import { incompleteSummary, renderMarkdownReport, scanStack, ScanResult } from './core/scan';
+import { RootFolder } from './core/text';
 import { FetchLike } from './core/sources/github';
-import { MsrcCache, parseDotnetListRuntimes, syncMsrc } from './core/sources/msrc';
+import { MsrcCache, msrcNeedsSync, parseDotnetListRuntimes, syncMsrc } from './core/sources/msrc';
 import { Ecosystem, Finding, ProjectStack, Severity } from './core/types';
 import { toDiagnostics } from './ui/diagnostics';
 import { VulnCodeActions } from './ui/codeActions';
@@ -22,6 +23,7 @@ let running: Promise<void> | undefined;
 let rerun = false;
 let debounce: NodeJS.Timeout | undefined;
 let rateLimitWarned = false;
+let fetchImpl: FetchLike | undefined;   // solo se sustituye en modo de pruebas
 
 const MAX_FILE_BYTES = 25 * 1024 * 1024;
 const cfg = () => vscode.workspace.getConfiguration('vulnsync');
@@ -41,7 +43,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.window.registerTreeDataProvider('vulnsync.stack', stackTree),
     vscode.languages.registerCodeActionsProvider(
       [{ pattern: '**/package.json' }, { pattern: '**/*.{csproj,fsproj,vbproj,props}' },
-       { pattern: '**/requirements*.txt' }, { pattern: '**/pyproject.toml' },
+       { pattern: '**/requirements*.txt' }, { pattern: '**/pyproject.toml' }, { pattern: '**/Pipfile' },
        { pattern: '**/*.lock' }, { pattern: '**/*lock.json' }, { pattern: '**/pnpm-lock.yaml' }, { pattern: '**/global.json' }],
       new VulnCodeActions(), { providedCodeActionKinds: VulnCodeActions.kinds }),
 
@@ -50,6 +52,8 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('vulnsync.report', showReport),
     vscode.commands.registerCommand('vulnsync.signIn', signIn),
     vscode.commands.registerCommand('vulnsync.clearCache', clearCache),
+    vscode.commands.registerCommand('vulnsync.suggestFix', (pkg: string, fixed: string, reason: string) =>
+      vscode.window.showInformationMessage(`VulnSync: ${pkg} → versión corregida ${fixed}. ${reason}`)),
     vscode.commands.registerCommand('vulnsync.ignore', ignoreFinding),
     vscode.commands.registerCommand('vulnsync.openAdvisory', (n: any) => {
       const f: Finding | undefined = n?.f ?? n;
@@ -67,12 +71,22 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Mostrar los resultados de la sesión anterior mientras corre el primer escaneo.
   const cached = context.workspaceState.get<{ stack: ProjectStack; result: ScanResult }>('lastScan');
-  if (cached) applyResult(cached.stack, cached.result);
+  if (cached?.result?.schema === 2) applyResult(cached.stack, cached.result);   // formatos antiguos se descartan
 
   setStatus('$(sync~spin) VulnSync', 'Escaneando…');
   statusBar.show();
   schedule();
   scheduleScan(2000);
+
+  // En pruebas de integración se expone una API mínima con red inyectable.
+  if (context.extensionMode === vscode.ExtensionMode.Test) {
+    return {
+      setFetch: (f: FetchLike | undefined) => { fetchImpl = f; },
+      scan: async () => { await requestScan({ interactive: false }); return lastResult; },
+      getState: () => ({ result: lastResult, stack: lastStack, status: statusBar.text, tooltip: String(statusBar.tooltip ?? '') }),
+      diagnosticCount: () => { let n = 0; diagnostics.forEach((_u, d) => { n += d.length; }); return n; },
+    };
+  }
 }
 
 export function deactivate() { /* recursos liberados vía subscriptions */ }
@@ -126,35 +140,40 @@ async function runScan(o: { interactive: boolean; forceMsrc?: boolean }, report:
     ecosystems: cfg().get<Ecosystem[]>('ecosystems', ['nuget', 'npm', 'pip']),
     includeTransitive: cfg().get<boolean>('includeTransitive', true),
   });
+  annotateWorkspaces(stack);
   output.appendLine(`Stack: ${stack.ecosystems.join(', ') || '—'} · ${stack.dependencies.length} dependencias · runtimes: ` +
     (stack.runtimes.map(r => `${r.product} ${r.band}`).join(', ') || '—'));
 
   // MSRC solo si hay runtimes .NET en el proyecto.
   let msrcCache: MsrcCache | undefined;
+  let msrcSyncError: string | undefined;
   let installed: ReturnType<typeof parseDotnetListRuntimes> | undefined;
-  if (cfg().get<boolean>('msrc.enabled', true) && stack.runtimes.length) {
+  const msrcEnabled = cfg().get<boolean>('msrc.enabled', true);
+  if (msrcEnabled && stack.runtimes.length) {
     msrcCache = await loadMsrcCache();
-    const age = msrcCache.syncedAt ? Date.now() - Date.parse(msrcCache.syncedAt) : Infinity;
     const maxAge = cfg().get<number>('syncIntervalHours', 12) * 3600_000;
-    if (o.forceMsrc || age > maxAge) {
+    if (o.forceMsrc || msrcNeedsSync(msrcCache, Date.now(), maxAge)) {
       try {
         report('Sincronizando boletines de Microsoft (MSRC)…');
         const r = await syncMsrc(httpFetch, msrcCache, cfg().get<number>('msrc.monthsToSync', 12), { signal: abort.signal, onProgress: report });
         msrcCache = r.cache;
         await saveMsrcCache(msrcCache);
         output.appendLine(`MSRC: ${Object.keys(msrcCache.docs).length} boletines en caché, ${r.downloaded} descargados.`);
+        for (const f of r.failed) output.appendLine(`[warn] MSRC ${f.id} no se pudo actualizar (intento ${f.attempts}, reintento tras ${f.nextRetryAt}): ${f.error}`);
       } catch (e: any) {
         if (e?.name === 'AbortError') throw e;
-        output.appendLine(`[warn] MSRC no disponible, se usa la caché: ${e?.message ?? e}`);
+        msrcSyncError = e?.message ?? String(e);
+        output.appendLine(`[warn] MSRC no disponible, se usa la caché si existe: ${msrcSyncError}`);
       }
     }
-    if (cfg().get<boolean>('msrc.checkInstalledRuntimes', true)) installed = await listInstalledRuntimes();
+    // Un proceso externo solo se ejecuta en workspaces de confianza.
+    if (vscode.workspace.isTrusted && cfg().get<boolean>('msrc.checkInstalledRuntimes', true)) installed = await listInstalledRuntimes();
   }
 
   const result = await scanStack(stack, {
     fetch: httpFetch,
     githubToken: await githubToken(),
-    msrcCache,
+    msrcCache, msrcSyncError, msrcDisabled: !msrcEnabled,
     installedRuntimes: installed,
     minimumSeverity: cfg().get<Severity>('minimumSeverity', 'low'),
     ignored: cfg().get<string[]>('ignoredAdvisories', []),
@@ -176,13 +195,20 @@ async function runScan(o: { interactive: boolean; forceMsrc?: boolean }, report:
   await ctx.workspaceState.update('lastScan', { stack, result });
 
   const real = result.findings.filter(f => !f.uncertain);
-  output.appendLine(`Escaneo terminado: ${real.length} vulnerabilidades, ${result.findings.length - real.length} por confirmar.`);
+  output.appendLine(`Escaneo terminado${result.complete ? '' : ' (INCOMPLETO)'}: ${real.length} vulnerabilidades, ${result.findings.length - real.length} por confirmar.`);
+  if (!result.complete) output.appendLine(`[warn] Escaneo incompleto:\n${incompleteSummary(result)}`);
   if (o.interactive) {
-    const msg = real.length
-      ? `VulnSync: ${real.length} vulnerabilidad(es) encontradas.`
-      : result.findings.length ? `VulnSync: sin vulnerabilidades confirmadas (${result.findings.length} por confirmar).`
-      : 'VulnSync: no se encontraron vulnerabilidades conocidas.';
-    vscode.window.showInformationMessage(msg, 'Ver reporte').then(c => c && showReport());
+    if (!result.complete) {
+      vscode.window.showWarningMessage(
+        `VulnSync: escaneo INCOMPLETO. ${real.length ? `${real.length} vulnerabilidad(es) confirmadas, pero faltan fuentes.` : 'Sin hallazgos, pero esto NO significa que el proyecto esté limpio.'}\n${incompleteSummary(result)}`,
+        'Ver reporte').then(c => c && showReport());
+    } else {
+      const msg = real.length
+        ? `VulnSync: ${real.length} vulnerabilidad(es) encontradas.`
+        : result.findings.length ? `VulnSync: sin vulnerabilidades confirmadas (${result.findings.length} por confirmar).`
+        : 'VulnSync: no se encontraron vulnerabilidades conocidas.';
+      vscode.window.showInformationMessage(msg, 'Ver reporte').then(c => c && showReport());
+    }
   }
 }
 
@@ -190,15 +216,23 @@ function applyResult(stack: ProjectStack, result: ScanResult) {
   lastStack = stack;
   lastResult = result;
   toDiagnostics(diagnostics, result.findings);
-  findingsTree.set(result.findings);
-  stackTree.set(stack, rootPath());
+  findingsTree.set(result.findings, result);
+  stackTree.set(stack, rootFolders());
 
   const real = result.findings.filter(f => !f.uncertain);
   const severe = real.filter(f => f.severity === 'critical' || f.severity === 'high').length;
+  const warnBg = new vscode.ThemeColor('statusBarItem.warningBackground');
   if (!stack.dependencies.length && !stack.runtimes.length) {
     setStatus('$(shield) VulnSync', 'No se detectó un stack compatible (.NET, Node.js, Python).');
+    statusBar.backgroundColor = undefined;
+  } else if (!result.complete) {
+    // Nunca verde ni "pass" cuando falta una fuente necesaria.
+    setStatus(real.length ? `$(shield) ${real.length} · incompleto` : '$(warning) VulnSync: incompleto',
+      `Escaneo incompleto: el resultado NO demuestra que el proyecto esté limpio.\n${incompleteSummary(result)}`);
+    statusBar.backgroundColor = severe ? new vscode.ThemeColor('statusBarItem.errorBackground') : warnBg;
   } else if (!real.length) {
-    setStatus('$(pass) VulnSync', `Sin vulnerabilidades confirmadas · ${result.checkedDependencies} dependencias verificadas`);
+    setStatus('$(pass) VulnSync', `Sin vulnerabilidades confirmadas · ${result.checkedDependencies} dependencias verificadas` +
+      (result.unverifiedDependencies ? ` · ${result.unverifiedDependencies} sin verificar` : ''));
     statusBar.backgroundColor = undefined;
   } else {
     setStatus(`$(shield) ${real.length}`, `${real.length} vulnerabilidades (${severe} críticas/altas). Clic para ver detalles.`);
@@ -225,14 +259,36 @@ async function readManifests(): Promise<ProjectFile[]> {
       out.push({ path: uri.fsPath, text: decoder.decode(await vscode.workspace.fs.readFile(uri)) });
     } catch { /* archivo ilegible: se omite */ }
   }));
+  // runtimeconfig.json vive en bin/ u obj/: se busca aparte, respetando el resto de exclusiones.
+  const rcExclude = exclude.filter(g => !/(^|\/)(bin|obj)(\/|$)/.test(g.replace(/^\*\*\//, '')));
+  const rcUris = await vscode.workspace.findFiles(RUNTIMECONFIG_GLOB, rcExclude.length ? `{${rcExclude.join(',')}}` : undefined, 500);
+  await Promise.all(rcUris.filter(u => !/\.runtimeconfig\.dev\.json$/i.test(u.fsPath)).map(async uri => {
+    try {
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (stat.size > MAX_FILE_BYTES) return;
+      out.push({ path: uri.fsPath, text: decoder.decode(await vscode.workspace.fs.readFile(uri)) });
+    } catch { /* ilegible */ }
+  }));
   return out.sort((a, b) => a.path.localeCompare(b.path));
 }
 
-const rootPath = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+/** Carpetas del workspace (multiraíz): cada archivo se resuelve contra la suya. */
+const rootFolders = (): RootFolder[] =>
+  (vscode.workspace.workspaceFolders ?? []).map(f => ({ name: f.name, path: f.uri.fsPath }));
+
+/** Guarda en cada ubicación el URI de su carpeta de workspace. */
+function annotateWorkspaces(stack: ProjectStack) {
+  const tag = (loc: { file: string; workspace?: string }) => {
+    loc.workspace = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(loc.file))?.uri.toString();
+  };
+  for (const d of stack.dependencies) tag(d.location);
+  for (const r of stack.runtimes) tag(r.location);
+  for (const k of stack.sdks ?? []) tag(k.location);
+}
 
 // ---------------- Red, auth y caché ----------------
 
-const httpFetch: FetchLike = (url, init) => fetch(url, init as RequestInit) as any;
+const httpFetch: FetchLike = (url, init) => (fetchImpl ?? ((u, i) => fetch(u, i as RequestInit) as any))(url, init);
 
 async function githubToken(): Promise<string | undefined> {
   if (!cfg().get<boolean>('github.useVSCodeAuth', true)) return undefined;
@@ -270,7 +326,17 @@ async function saveMsrcCache(c: MsrcCache) {
 async function clearCache() {
   try { await vscode.workspace.fs.delete(cacheUri()); } catch { /* no existía */ }
   await ctx.workspaceState.update('lastScan', undefined);
-  vscode.window.showInformationMessage('VulnSync: caché borrada.');
+  // Nada del resultado anterior debe quedar visible ni reutilizable.
+  lastStack = undefined;
+  lastResult = undefined;
+  diagnostics.clear();
+  findingsTree.clear();
+  stackTree.clear();
+  statusBar.backgroundColor = undefined;
+  setStatus('$(shield) VulnSync', 'Caché borrada. Ejecuta un escaneo para ver resultados.');
+  // No se espera la respuesta: el borrado ya terminó y el aviso puede quedar sin atender.
+  void vscode.window.showInformationMessage('VulnSync: caché borrada.', 'Borrar y volver a escanear')
+    .then(pick => pick && requestScan({ interactive: true, forceMsrc: true }));
 }
 
 function listInstalledRuntimes(): Promise<ReturnType<typeof parseDotnetListRuntimes> | undefined> {
@@ -287,7 +353,7 @@ function listInstalledRuntimes(): Promise<ReturnType<typeof parseDotnetListRunti
 async function showReport() {
   if (!lastStack || !lastResult) { await requestScan({ interactive: true }); }
   if (!lastStack || !lastResult) return;
-  const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: renderMarkdownReport(lastStack, lastResult, rootPath()) });
+  const doc = await vscode.workspace.openTextDocument({ language: 'markdown', content: renderMarkdownReport(lastStack, lastResult, rootFolders()) });
   await vscode.window.showTextDocument(doc, { preview: false });
   await vscode.commands.executeCommand('markdown.showPreview', doc.uri);
 }

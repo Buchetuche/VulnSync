@@ -19,14 +19,24 @@ No requiere claves de API. Si inicias sesión en GitHub desde VS Code (comando *
 |---|---|---|
 | .NET / NuGet | `*.csproj`, `*.fsproj`, `*.vbproj`, `Directory.Packages.props` (CPM), `Directory.Build.props`, `global.json` | `packages.lock.json`; runtimes vía `dotnet --list-runtimes` o `RuntimeFrameworkVersion` |
 | Node.js / npm | `package.json` (incl. monorepos) | `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock` (v1 y Berry), `pnpm-lock.yaml` |
-| Python / PyPI | `requirements*.txt`, `pyproject.toml` (PEP 621, `dependency-groups`, Poetry) | `poetry.lock`, `uv.lock`, `Pipfile.lock`, o pines `==` |
+| Python / PyPI | `requirements*.txt`, `pyproject.toml` (PEP 621, `dependency-groups`, Poetry), `Pipfile` | `poetry.lock`, `uv.lock`, `Pipfile.lock`, o pines `==` |
 
-Sin lockfile, la versión se aproxima con el límite inferior del rango declarado (`^4.17.0` → `4.17.0`) y el hallazgo se muestra como **por confirmar**. Lo mismo ocurre con los boletines de .NET cuando `dotnet` no está en el PATH.
+Sin lockfile **no se asume** una versión instalada: se consultan todos los avisos del paquete y se marca como **por confirmar** cualquier aviso cuyo rango vulnerable intersecte el rango declarado. Si el rango no se puede interpretar, la dependencia queda como **no verificada**. En monorepos npm cada workspace se resuelve por su ruta dentro del lockfile.
+
+Las dependencias de desarrollo (`[dev-packages]`, `devDependencies`) se analizan por defecto.
+
+### Estado de cada fuente
+
+El resultado nunca se muestra como limpio si una fuente falló: cada una se reporta como `completa`, `parcial`, `datos en caché`, `falló` o `no aplica`. Si algo falta, la barra de estado, el árbol y el reporte indican **Escaneo incompleto**.
+
+### Runtimes de .NET
+
+`global.json` solo informa del SDK. Cada aplicación (proyecto ejecutable) se evalúa por separado con su TFM, `RuntimeFrameworkVersion`, `SelfContained`, `RollForward` y, si existe, su `*.runtimeconfig.json`. `dotnet --list-runtimes` es evidencia auxiliar (solo en workspaces de confianza). Una biblioteca, o una aplicación autocontenida sin versión fijada, produce hallazgos **por confirmar**.
 
 ## En el editor
 
 - **Diagnósticos** sobre la línea exacta de la versión en el manifiesto (error para crítica/alta, advertencia para media, información para baja o por confirmar), con el ID enlazado al boletín.
-- **Acciones rápidas** (`Ctrl+.`): actualizar a la versión corregida conservando el prefijo del rango, descargar el runtime de .NET, abrir el boletín o ignorar el ID.
+- **Acciones rápidas** (`Ctrl+.`): actualizar a la versión corregida solo en pines y rangos simples (con vista previa; en rangos complejos solo se sugiere y nunca se amplía el rango), descargar el runtime de .NET, abrir el boletín o ignorar el ID.
 - **Panel VulnSync** en la barra de actividad: vulnerabilidades agrupadas por paquete y el stack detectado.
 - **Barra de estado** con el conteo; roja si hay hallazgos críticos o altos.
 - **Reporte Markdown** (`VulnSync: Generar reporte`) para adjuntar a un PR o ticket.
@@ -53,12 +63,13 @@ Sin lockfile, la versión se aproxima con el límite inferior del rango declarad
 npm install
 npm run compile      # compila a out/
 npm test             # pruebas unitarias del núcleo (node --test)
-npm run package      # genera vulnsync-0.1.0.vsix
+npm run test:integration   # pruebas dentro de VS Code (descarga una copia aislada)
+npm run package      # recompila y genera vulnsync-0.1.1.vsix
 ```
 
 Pulsa **F5** en VS Code para abrir una ventana de desarrollo con la extensión cargada.
 
-Instalar el `.vsix`: *Extensiones → … → Instalar desde VSIX*, o `code --install-extension vulnsync-0.1.0.vsix`.
+Instalar el `.vsix`: *Extensiones → … → Instalar desde VSIX*, o `code --install-extension vulnsync-0.1.1.vsix`.
 
 ### Estructura
 
@@ -76,10 +87,11 @@ src/
   extension.ts          # activación, comandos, watchers, caché
 ```
 
-Para publicar en el Marketplace, sube el `.vsix` desde la página de gestión del Marketplace o ejecuta `npx @vscode/vsce publish`.
+Para publicar en el Marketplace, sube el `.vsix` desde la página de gestión del Marketplace o ejecuta `npx vsce publish`.
 
 ## Limitaciones conocidas
 
 - Las propiedades MSBuild en versiones (`Version="$(MyVersion)"`) no se resuelven.
 - MSRC solo se usa para .NET / ASP.NET Core; los paquetes NuGet de Microsoft (p. ej. `System.Text.Json`) se cubren por GitHub Advisory, donde Microsoft también publica sus avisos.
-- Los runtimes autocontenidos (`SelfContained`) se evalúan con la versión fijada en `RuntimeFrameworkVersion` si existe.
+- Los runtimes autocontenidos solo se confirman con una versión fijada (`RuntimeFrameworkVersion` o `runtimeconfig.json`); la arquitectura/plataforma (RID) no se distingue.
+- yarn y pnpm se resuelven por nombre: si un paquete tiene varias versiones en el lockfile queda sin determinar y se usa su rango.
