@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { compareVersions, satisfiesGhsaRange, lowerBoundOf, exactPin } from '../core/version';
 import { detectStack, ProjectFile } from '../core/detect';
 import { matchGithubAdvisories, queryGithubAdvisories, GhsaAdvisory } from '../core/sources/github';
-import { reduceCvrf, matchMsrc, parseDotnetListRuntimes, syncMsrc } from '../core/sources/msrc';
+import { reduceCvrf, matchMsrc, parseDotnetListRuntimes, syncMsrc, normalizeMsrcCache, msrcNeedsSync, MSRC_CACHE_SCHEMA } from '../core/sources/msrc';
 import { scanStack, renderMarkdownReport } from '../core/scan';
 
 // ---------- versiones ----------
@@ -202,6 +202,49 @@ test('reduceCvrf conserva solo .NET / ASP.NET Core y una entrada por banda', () 
   assert.equal(asp.product, 'ASP.NET Core');
   assert.equal(asp.severity, 'critical');
   assert.equal(asp.fixedBuild, '8.0.11');
+});
+
+test('MSRC separa versiones de runtime y de SDK', () => {
+  const doc = {
+    ProductTree: { FullProductName: [{ ProductID: '1', Value: '.NET 8.0 installed on Windows' }] },
+    Vulnerability: [
+      { CVE: 'CVE-SOLO-SDK', ProductStatuses: [{ Type: 3, ProductID: ['1'] }], Remediations: [{ ProductID: ['1'], FixedBuild: '8.0.427' }] },
+      { CVE: 'CVE-AMBAS', ProductStatuses: [{ Type: 3, ProductID: ['1'] }],
+        Remediations: [{ ProductID: ['1'], FixedBuild: '8.0.427' }, { ProductID: ['1'], FixedBuild: '8.0.32' }] },
+    ],
+  };
+  const e = reduceCvrf(doc, 'x');
+  const soloSdk = e.find(x => x.cve === 'CVE-SOLO-SDK')!;
+  assert.equal(soloSdk.fixedBuild, undefined);
+  assert.equal(soloSdk.sdkFixedBuild, '8.0.427');
+  assert.equal(e.find(x => x.cve === 'CVE-AMBAS')!.fixedBuild, '8.0.32');
+  const target = {
+    product: '.NET' as const, band: '8.0', app: 'a.csproj', appKind: 'app' as const, evidence: 't', source: 't',
+    location: { file: 'a.csproj', line: 0, startCol: 0, endCol: 1 },
+  };
+  const f = matchMsrc([target], e, [{ product: '.NET', version: '8.0.28' }]);
+  const sdkF = f.find(x => x.id === 'CVE-SOLO-SDK')!;
+  assert.ok(sdkF.uncertain);
+  assert.equal(sdkF.fixedVersion, 'SDK 8.0.427');
+  const ambas = f.find(x => x.id === 'CVE-AMBAS')!;
+  assert.ok(!ambas.uncertain);
+  assert.equal(ambas.fixedVersion, '8.0.32');
+  assert.ok(!matchMsrc([target], e, [{ product: '.NET', version: '8.0.32' }]).some(x => x.id === 'CVE-AMBAS'));
+});
+
+test('la caché de MSRC de otra versión se descarta y fuerza una nueva descarga', () => {
+  const old = { syncedAt: '2026-10-29T00:00:00Z', docs: { '2026-Oct': { currentReleaseDate: 'x', entries: [{ cve: 'CVE-1', fixedBuild: '8.0.427' }] } } };
+  const n = normalizeMsrcCache(old);
+  assert.deepEqual(n.docs, {});
+  assert.equal(n.syncedAt, undefined);
+  assert.equal(n.schema, MSRC_CACHE_SCHEMA);
+  assert.ok(msrcNeedsSync(n, Date.now(), 12 * 3600_000));
+  // Basura o ausente: también se reinicia.
+  assert.deepEqual(normalizeMsrcCache(null).docs, {});
+  assert.deepEqual(normalizeMsrcCache('x').docs, {});
+  // Una caché de la versión actual se conserva tal cual.
+  const cur = { schema: MSRC_CACHE_SCHEMA, syncedAt: '2026-10-29T00:00:00Z', docs: { a: { currentReleaseDate: 'x', entries: [] } } };
+  assert.equal(normalizeMsrcCache(cur), cur);
 });
 
 test('matchMsrc usa los runtimes instalados', () => {

@@ -1,4 +1,14 @@
+# Dependencias y compilación
 node_modules/
 out/
+
+# Paquetes generados
 *.vsix
+
+# Pruebas de VS Code
 .vscode-test/
+
+# Archivos del sistema y registros
+.DS_Store
+Thumbs.db
+*.log

@@ -4,7 +4,7 @@ import { detectStack, MANIFEST_GLOB, ProjectFile, RUNTIMECONFIG_GLOB } from './c
 import { incompleteSummary, renderMarkdownReport, scanStack, ScanResult } from './core/scan';
 import { RootFolder } from './core/text';
 import { FetchLike } from './core/sources/github';
-import { MsrcCache, msrcNeedsSync, parseDotnetListRuntimes, syncMsrc } from './core/sources/msrc';
+import { MsrcCache, msrcNeedsSync, normalizeMsrcCache, parseDotnetListRuntimes, syncMsrc } from './core/sources/msrc';
 import { Ecosystem, Finding, ProjectStack, Severity } from './core/types';
 import { toDiagnostics } from './ui/diagnostics';
 import { VulnCodeActions } from './ui/codeActions';
@@ -314,8 +314,8 @@ function cacheUri() { return vscode.Uri.joinPath(ctx.globalStorageUri, 'msrc-cac
 async function loadMsrcCache(): Promise<MsrcCache> {
   try {
     const raw = await vscode.workspace.fs.readFile(cacheUri());
-    return JSON.parse(new TextDecoder().decode(raw));
-  } catch { return { docs: {} }; }
+    return normalizeMsrcCache(JSON.parse(new TextDecoder().decode(raw)));
+  } catch { return normalizeMsrcCache(undefined); }
 }
 
 async function saveMsrcCache(c: MsrcCache) {
