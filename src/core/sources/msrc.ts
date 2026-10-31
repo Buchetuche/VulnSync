@@ -18,7 +18,8 @@ export interface MsrcEntry {
   product: '.NET' | 'ASP.NET Core';
   band: string;           // "8.0"
   productName: string;    // ".NET 8.0 installed on Windows"
-  fixedBuild?: string;    // "8.0.11"
+  fixedBuild?: string;    // versión de runtime que corrige: "8.0.11"
+  sdkFixedBuild?: string; // versión de SDK que corrige: "8.0.427" (parche >= 100)
   kb?: string;
   docId: string;          // "2026-Oct"
 }
@@ -39,7 +40,15 @@ export interface MsrcFailure {
   nextRetryAt: string;
 }
 
+/**
+ * Versión del formato/reducción de la caché. Subirla cada vez que cambie `reduceCvrf` o `MsrcEntry`:
+ * una caché de otra versión se descarta y se vuelve a descargar (si no, conservaría resultados erróneos).
+ * 2: separa versiones de runtime y de SDK (`sdkFixedBuild`).
+ */
+export const MSRC_CACHE_SCHEMA = 2;
+
 export interface MsrcCache {
+  schema?: number;
   /** Última sincronización COMPLETA (sin documentos fallidos). */
   syncedAt?: string;
   /** Último intento, completo o no. */
@@ -76,6 +85,14 @@ export function retryDelayMs(attempts: number): number {
   return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.max(0, attempts - 1));
 }
 
+/** Valida la caché leída del disco: cualquier otra versión o forma inesperada se descarta. */
+export function normalizeMsrcCache(raw: any): MsrcCache {
+  if (raw && typeof raw === 'object' && raw.schema === MSRC_CACHE_SCHEMA && raw.docs && typeof raw.docs === 'object') {
+    return raw as MsrcCache;
+  }
+  return { schema: MSRC_CACHE_SCHEMA, docs: {} };
+}
+
 /** ¿Toca sincronizar? Por antigüedad de la última sincronización completa o por reintentos vencidos. */
 export function msrcNeedsSync(cache: MsrcCache, now: number, intervalMs: number): boolean {
   if (!cache.syncedAt || now - Date.parse(cache.syncedAt) > intervalMs) return true;
@@ -99,7 +116,7 @@ export async function syncMsrc(
     .slice(0, months);
 
   const attemptAt = new Date(nowMs()).toISOString();
-  const next: MsrcCache = { syncedAt: undefined, lastAttemptAt: attemptAt, docs: {}, failed: [] };
+  const next: MsrcCache = { schema: MSRC_CACHE_SCHEMA, syncedAt: undefined, lastAttemptAt: attemptAt, docs: {}, failed: [] };
   const prevFailed = new Map((cache.failed ?? []).map(f => [f.id, f]));
   let downloaded = 0;
   for (const u of updates) {
@@ -194,13 +211,16 @@ export function reduceCvrf(doc: any, docId: string): MsrcEntry[] {
       const score = asArray(v.CVSSScoreSets).find((c: any) => includesId(c.ProductID, pid))?.BaseScore
         ?? asArray(v.CVSSScoreSets)[0]?.BaseScore;
       const rem = asArray(v.Remediations).filter((r: any) => includesId(r.ProductID, pid));
-      const fixed = rem
+      // MSRC mezcla versiones de runtime (8.0.32) y de SDK (8.0.427, parche >= 100).
+      // Solo las de runtime se pueden comparar con `dotnet --list-runtimes`.
+      const builds: string[] = rem
         .map((r: any) => r.FixedBuild || r.Description?.Value)
         .filter((s: any) => typeof s === 'string' && /^\d+\.\d+\.\d+/.test(s.trim()))
         .map((s: string) => s.trim())
         .filter((s: string) => majorMinor(s) === prod.band)
-        .sort(compareVersions)
-        .pop();
+        .sort(compareVersions);
+      const fixed = builds.filter(isRuntimeBuild).pop();
+      const sdkFixed = builds.filter(b => !isRuntimeBuild(b)).pop();
       const kb = rem.map((r: any) => r.Description?.Value).find((s: any) => typeof s === 'string' && /^\d{6,8}$/.test(s));
 
       out.push({
@@ -212,6 +232,7 @@ export function reduceCvrf(doc: any, docId: string): MsrcEntry[] {
         band: prod.band,
         productName: prod.name,
         fixedBuild: fixed,
+        sdkFixedBuild: sdkFixed,
         kb: kb ? `KB${kb}` : undefined,
         docId,
       });
@@ -230,6 +251,12 @@ function flattenProducts(tree: any): any[] {
   };
   walk(tree?.Branch);
   return out;
+}
+
+/** true para versiones de runtime (parche < 100); false para SDK (8.0.427). */
+export function isRuntimeBuild(version: string): boolean {
+  const patch = parseInt(version.split('.')[2] ?? '0', 10);
+  return isNaN(patch) || patch < 100;
 }
 
 function mapSeverity(s: string | undefined): Severity {
@@ -345,7 +372,7 @@ export function matchMsrc(
         ecosystem: 'runtime',
         installedVersion: eff.version,
         vulnerableRange: e.fixedBuild ? `< ${e.fixedBuild}` : undefined,
-        fixedVersion: e.fixedBuild,
+        fixedVersion: e.fixedBuild ?? (e.sdkFixedBuild ? `SDK ${e.sdkFixedBuild}` : undefined),
         uncertain,
         location: t.location,
         direct: true,

@@ -4,6 +4,10 @@
 
 Correcciones de la auditoría de 0.1.0 (VS-001 … VS-013).
 
+**MSRC**
+- Corregido: algunos boletines de MSRC indican la versión corregida del **SDK** de .NET (por ejemplo 8.0.427) en lugar de la del **runtime**. Antes se comparaba con el runtime instalado y producía avisos falsos ("actualiza a 8.0.427"); ahora se usa la versión de runtime cuando existe y, si MSRC solo publica la del SDK, el hallazgo se marca como "por confirmar" y muestra `SDK 8.0.427` como versión corregida.
+- La caché de boletines MSRC ahora lleva versión de formato: la creada por 0.1.0 (con las versiones de SDK mezcladas) se descarta automáticamente al actualizar y se vuelve a descargar, sin que haga falta borrarla a mano.
+
 **Seguridad y confiabilidad**
 - VS-001: cada fuente (GitHub, MSRC) tiene estado `complete / partial / cached / failed / notApplicable`. Un escaneo incompleto se muestra como tal en la barra de estado, la notificación, el árbol y el reporte, y nunca en verde. Solo cuentan como verificadas las dependencias cuyos lotes terminaron bien.
 - VS-002: sin lockfile se consulta por nombre y se compara la intersección del rango declarado con el vulnerable (SemVer, NuGet, PEP 440/Poetry). NuGet `1.2.3` sin lockfile ya no se trata como versión instalada.
